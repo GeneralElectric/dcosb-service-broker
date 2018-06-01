@@ -8,29 +8,18 @@ import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model.{HttpEntity, StatusCodes}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.directives.Credentials
-import akka.http.scaladsl.server.{
-  RequestContext,
-  Route,
-  RouteConcatenation,
-  RouteResult
-}
+import akka.http.scaladsl.server.{RequestContext, Route, RouteConcatenation, RouteResult}
 import akka.util.Timeout
 import akka.pattern.ask
 import com.typesafe.config.Config
 import io.predix.dcosb.dcos.DCOSCommon
 import io.predix.dcosb.dcos.service.PlanApiClient
-import io.predix.dcosb.servicebroker.OpenServiceBrokerApi.APIModel.{
-  BindApplicationToServiceInstance,
-  CreateInstance,
-  UpdateInstance
-}
+import io.predix.dcosb.servicebroker.OpenServiceBrokerApi.APIModel.{BindApplicationToServiceInstance, CreateInstance, UpdateInstance}
+import io.predix.dcosb.servicemodule.api.ServiceModule.{InsufficientApplicationPermissions, MalformedRequest, OperationDenied}
 import io.predix.dcosb.util.actor.HttpClientActor
 import io.predix.dcosb.servicemodule.api.util.ServiceLoader
 import spray.json._
-import io.predix.dcosb.servicemodule.api.{
-  ServiceModule,
-  ServiceModuleConfiguration
-}
+import io.predix.dcosb.servicemodule.api.{ServiceModule, ServiceModuleConfiguration}
 import io.predix.dcosb.util.JsonFormats
 import io.predix.dcosb.util.actor.ConfiguredActor
 import org.apache.commons.codec.binary.Hex
@@ -252,6 +241,11 @@ class OpenServiceBrokerApi
                                     APIModel.OperationResponse(
                                       ServiceModule.OSB.Operation.CREATE
                                         .toString()))
+
+                                case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                  complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                case Success(Failure(MalformedRequest(message))) =>
+                                  complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
                                 case Success(Failure(e: Throwable)) =>
                                   log.error(
                                     s"CreateServiceInstance for ServiceModule(${configuration.serviceId} sent failure $e")
@@ -358,6 +352,10 @@ class OpenServiceBrokerApi
                                               APIModel.OperationResponse(
                                                 ServiceModule.OSB.Operation.UPDATE
                                                   .toString()))
+                                          case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                            complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                          case Success(Failure(MalformedRequest(message))) =>
+                                            complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
                                           case Success(Failure(e: Throwable)) =>
                                             log.error(
                                               s"UpdateServiceInstance for ServiceModule(${configuration.serviceId} sent failure $e")
@@ -424,6 +422,10 @@ class OpenServiceBrokerApi
                                     APIModel.OperationResponse(
                                       ServiceModule.OSB.Operation.DESTROY
                                         .toString()))
+                                case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                  complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                case Success(Failure(MalformedRequest(message))) =>
+                                  complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
                                 case Success(Failure(e: Throwable)) =>
                                   log.error(
                                     s"ServiceModule(${configuration.serviceId}) failed to destroy service instance $serviceInstanceId, failure was $e")
@@ -490,12 +492,17 @@ class OpenServiceBrokerApi
                                           bindResponse)
 
                                       complete(StatusCodes.OK, bindResponseJson)
-
+                                    case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                      complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                    case Success(Failure(MalformedRequest(message))) =>
+                                      complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
+                                    case Success(Failure(ServiceModule.ServiceInstanceNotFound(message))) =>
+                                      complete(StatusCodes.NotFound, APIModel.ServiceBrokerError(message))
                                     case Success(Failure(e: Throwable)) =>
                                       log.error(
                                         s"Bind application to service instance returned failure: $e")
                                       complete(
-                                        StatusCodes.InternalServerError,
+                                        StatusCodes.ServiceUnavailable,
                                         APIModel.ServiceBrokerError(
                                           s"Service module failed to create binding, contact support."))
 
@@ -549,6 +556,24 @@ class OpenServiceBrokerApi
                                     case Success(Success(unbound)) =>
                                       complete(StatusCodes.OK,
                                         APIModel.DefaultEmptyApiResponse())
+                                    case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                      complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                    case Success(Failure(MalformedRequest(message))) =>
+                                      complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
+                                    case Success(Failure(e: Throwable)) =>
+                                      log.error(
+                                        s"Unbind application from service instance returned failure: $e")
+                                      complete(
+                                        StatusCodes.ServiceUnavailable,
+                                        APIModel.ServiceBrokerError(
+                                          s"Service module failed to erase binding, contact support."))
+                                    case Failure(e: Throwable) =>
+                                      log.error(
+                                        s"Failed to get unbind response response from service module, failure was: $e")
+                                      complete(
+                                        StatusCodes.InternalServerError,
+                                        APIModel.ServiceBrokerError(
+                                          s"Service module error, contact support."))
                                   }
                                 }))
 
@@ -578,16 +603,20 @@ class OpenServiceBrokerApi
                                       complete(StatusCodes.OK, status)
 
                                     case Success(Failure(
-                                    e: PlanApiClient.ServiceNotFound)) =>
+                                    _: PlanApiClient.ServiceNotFound)) | Success(Failure(_: ServiceModule.ServiceInstanceNotFound)) =>
                                       complete(
                                         StatusCodes.NotFound,
                                         APIModel.ServiceBrokerError(
                                           s"Service with id $serviceInstanceId was not found (it may have been deleted)"))
+                                    case Success(Failure(InsufficientApplicationPermissions(message))) =>
+                                      complete(StatusCodes.Unauthorized, APIModel.ServiceBrokerError(message))
+                                    case Success(Failure(MalformedRequest(message))) =>
+                                      complete(StatusCodes.BadRequest, APIModel.ServiceBrokerError(message))
                                     case Success(Failure(e: Throwable)) =>
                                       log.error(
                                         s"Last operation returned failure: $e")
                                       complete(
-                                        StatusCodes.InternalServerError,
+                                        StatusCodes.ServiceUnavailable,
                                         APIModel.ServiceBrokerError(
                                           s"Service module failed to retrieve last operation, contact support."))
                                     case Failure(e: Throwable) =>

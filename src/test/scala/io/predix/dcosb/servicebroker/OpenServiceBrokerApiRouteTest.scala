@@ -3,8 +3,17 @@ package io.predix.dcosb.servicebroker
 import java.util.concurrent.TimeUnit
 
 import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
-import akka.http.scaladsl.model.{FormData, HttpRequest, HttpResponse, StatusCodes}
-import akka.http.scaladsl.model.headers.{Authorization, BasicHttpCredentials, HttpChallenges}
+import akka.http.scaladsl.model.{
+  FormData,
+  HttpRequest,
+  HttpResponse,
+  StatusCodes
+}
+import akka.http.scaladsl.model.headers.{
+  Authorization,
+  BasicHttpCredentials,
+  HttpChallenges
+}
 import akka.http.scaladsl.server.AuthenticationFailedRejection
 import akka.testkit.{CallingThreadDispatcher, TestActorRef}
 import akka.util.Timeout
@@ -12,12 +21,30 @@ import akka.pattern.ask
 import io.predix.dcosb.dcos.{DCOSCommon, DCOSProxy}
 import io.predix.dcosb.servicebroker.OpenServiceBrokerApi.APIModel.JsonSupport
 import io.predix.dcosb.servicebroker.OpenServiceBrokerApi.APIModel
-import io.predix.dcosb.servicemodule.api.ServiceModule.ServiceInstanceDestroyed
+import io.predix.dcosb.servicemodule.api.ServiceModule.{
+  InsufficientApplicationPermissions,
+  MalformedRequest,
+  ServiceInstanceDestroyed
+}
 import io.predix.dcosb.servicemodule.api.ServiceModuleMockingSuite.TestServiceModule
-import io.predix.dcosb.servicemodule.api.util.BasicServiceModule.{DCOSModelSupport, OpenServiceBrokerModelSupport}
-import io.predix.dcosb.servicemodule.api.util.{BasicServiceModule, ServiceLoader, StubServiceModule}
-import io.predix.dcosb.servicemodule.api.util.BasicServiceModule.OpenServiceBrokerModelSupport.{CommonProvisionInstanceParameters, CommonUpdateInstanceParameters}
-import io.predix.dcosb.servicemodule.api.{ServiceModule, ServiceModuleConfiguration, ServiceModuleMockingSuite}
+import io.predix.dcosb.servicemodule.api.util.BasicServiceModule.{
+  DCOSModelSupport,
+  OpenServiceBrokerModelSupport
+}
+import io.predix.dcosb.servicemodule.api.util.{
+  BasicServiceModule,
+  ServiceLoader,
+  StubServiceModule
+}
+import io.predix.dcosb.servicemodule.api.util.BasicServiceModule.OpenServiceBrokerModelSupport.{
+  CommonProvisionInstanceParameters,
+  CommonUpdateInstanceParameters
+}
+import io.predix.dcosb.servicemodule.api.{
+  ServiceModule,
+  ServiceModuleConfiguration,
+  ServiceModuleMockingSuite
+}
 import io.predix.dcosb.util.RouteSuite
 
 import scala.collection.immutable.HashMap
@@ -55,6 +82,12 @@ class OpenServiceBrokerApiRouteTest
         serviceBroker ? OpenServiceBrokerApi.Configuration(childMaker),
         timeout.duration)
 
+      val aksmStub = TestActorRef(Props(new Actor {
+        override def receive = {
+          case _ =>
+        }
+      }))
+
       val testServiceModuleMock = new TestServiceModuleMock()
 
       val serviceModule = testServiceModuleMock.serviceModule
@@ -65,6 +98,7 @@ class OpenServiceBrokerApiRouteTest
             stubFunction[DCOSCommon.Connection,
                          ((HttpRequest,
                            String) => Future[(HttpResponse, String)])],
+            aksmStub,
             serviceId),
         timeout.duration
       )
@@ -81,7 +115,9 @@ class OpenServiceBrokerApiRouteTest
           DCOSModelSupport.CommonPackageOptions]]]
 
       // TODO ..an NPE here will be a missing basic plan :p
-      val basicPlan = (serviceConfiguration.get.openService.plans find { _.id == "basic" }).get
+      val basicPlan = (serviceConfiguration.get.openService.plans find {
+        _.id == "basic"
+      }).get
 
       val serviceModules: ServiceLoader.ServiceList =
         List((serviceId, (serviceConfiguration.get, serviceModule)))
@@ -191,22 +227,73 @@ class OpenServiceBrokerApiRouteTest
                   }
                 }
 
-                "and a service module that delivers a failure to a create instance request" - {
+                "and a service module that delivers in a failure," - {
 
-                  "it responds with HTTP 500" in new RouteMock {
-                    override def serviceId = "test-service"
-                    import BasicServiceModule.DCOSModelSupport._
+                  "any Throwable" - {
 
-                    // set up createInstance mock to provide expected response to the route
-                    val createInstance =
-                      testServiceModuleMock.createServiceInstance()._1
-                    createInstance expects ("foo-org", basicPlan, "foo-service-guid", "foo-space", "foo-service-1", Some(
-                      CommonProvisionInstanceParameters(3))) onCall { (p) =>
-                      Future.failed(new Throwable {})
-                    } once ()
+                    "it returns HTTP 500" in new RouteMock {
+                      override def serviceId = "test-service"
+                      import BasicServiceModule.DCOSModelSupport._
 
-                    createRequest ~> route ~> check {
-                      response.status shouldEqual StatusCodes.ServiceUnavailable
+                      // set up createInstance mock to provide expected response to the route
+                      val createInstance =
+                        testServiceModuleMock.createServiceInstance()._1
+                      createInstance expects ("foo-org", basicPlan, "foo-service-guid", "foo-space", "foo-service-1", Some(
+                        CommonProvisionInstanceParameters(3))) onCall { (p) =>
+                        Future.failed(new Throwable {})
+                      } once ()
+
+                      createRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.ServiceUnavailable
+                      }
+
+                    }
+
+                  }
+
+                  "an InsufficientApplicationPermissions Throwable" - {
+
+                    "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+
+                      override def serviceId = "test-service"
+
+                      // set up createInstance mock to provide expected response to the route
+                      val createInstance =
+                        testServiceModuleMock.createServiceInstance()._1
+                      createInstance expects ("foo-org", basicPlan, "foo-service-guid", "foo-space", "foo-service-1", Some(
+                        CommonProvisionInstanceParameters(3))) onCall { (p) =>
+                        Future.failed(
+                          new InsufficientApplicationPermissions("foo"))
+                      } once ()
+
+                      createRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.Unauthorized
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
+                  }
+
+                  "a MalformedRequest Throwable" - {
+
+                    "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+
+                      override def serviceId = "test-service"
+
+                      // set up createInstance mock to provide expected response to the route
+                      val createInstance =
+                        testServiceModuleMock.createServiceInstance()._1
+                      createInstance expects ("foo-org", basicPlan, "foo-service-guid", "foo-space", "foo-service-1", Some(
+                        CommonProvisionInstanceParameters(3))) onCall { (p) =>
+                        Future.failed(new MalformedRequest("foo"))
+                      } once ()
+
+                      createRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.BadRequest
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
                     }
 
                   }
@@ -251,17 +338,81 @@ class OpenServiceBrokerApiRouteTest
                   s"$servicePrefix/broker/v2/service_instances/foo-instance/?service_id=service-guid&plan_id=basic")
                   .addHeader(credentials)
 
-                "it returns HTTP Accepted with a json response indicating the correct pending operation" in new RouteMock {
-                  override def serviceId = "test-service"
+                "and a service module that delivers a ServiceInstanceDestoryed message" - {
 
-                  val destroyInstance =
-                    testServiceModuleMock.destroyServiceInstance()._1
-                  destroyInstance expects ("service-guid", basicPlan, "foo-instance", None, *) returning (Future
-                    .successful(ServiceInstanceDestroyed("foo-instance"))) once ()
+                  "it returns HTTP Accepted with a json response indicating the correct pending operation" in new RouteMock {
+                    override def serviceId = "test-service"
 
-                  deprovisionRequest ~> route ~> check {
-                    response.status shouldEqual StatusCodes.Accepted
-                    responseAs[String] shouldEqual """{"operation":"destroy"}"""
+                    val destroyInstance =
+                      testServiceModuleMock.destroyServiceInstance()._1
+                    destroyInstance expects ("service-guid", basicPlan, "foo-instance", None, *) returning (Future
+                      .successful(ServiceInstanceDestroyed("foo-instance"))) once ()
+
+                    deprovisionRequest ~> route ~> check {
+                      response.status shouldEqual StatusCodes.Accepted
+                      responseAs[String] shouldEqual """{"operation":"destroy"}"""
+                    }
+
+                  }
+
+                }
+
+                "and a service module that delivers in a failure," - {
+
+                  "any Throwable" - {
+
+                    "it returns HTTP 500" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val destroyInstance =
+                        testServiceModuleMock.destroyServiceInstance()._1
+                      destroyInstance expects ("service-guid", basicPlan, "foo-instance", None, *) returning (Future
+                        .failed(new Throwable {})) once ()
+
+                      deprovisionRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.ServiceUnavailable
+                      }
+
+                    }
+
+                  }
+
+                  "an InsufficientApplicationPermissions Throwable" - {
+
+                    "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val destroyInstance =
+                        testServiceModuleMock.destroyServiceInstance()._1
+                      destroyInstance expects ("service-guid", basicPlan, "foo-instance", None, *) returning (Future
+                        .failed(new InsufficientApplicationPermissions("foo"))) once ()
+
+                      deprovisionRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.Unauthorized
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
+                  }
+
+                  "a MalformedRequest Throwable" - {
+
+                    "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val destroyInstance =
+                        testServiceModuleMock.destroyServiceInstance()._1
+                      destroyInstance expects ("service-guid", basicPlan, "foo-instance", None, *) returning (Future
+                        .failed(new MalformedRequest("foo"))) once ()
+
+                      deprovisionRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.BadRequest
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
                   }
 
                 }
@@ -274,19 +425,82 @@ class OpenServiceBrokerApiRouteTest
                   s"$servicePrefix/broker/v2/service_instances/foo-instance/last_operation/?operation=create")
                   .addHeader(credentials)
 
-                "it invokes the service module to return a json representation of operation status" in new RouteMock {
-                  override def serviceId = "test-service"
+                "and a service module that delivers a LastOperationStatus message" - {
 
-                  val lastOperation = testServiceModuleMock.lastOperation()._1
-                  lastOperation expects (None, None, "foo-instance", ServiceModule.OSB.Operation.CREATE, None, *, *) returning (Future
-                    .successful(
-                      ServiceModule.LastOperationStatus(
+                  "it returns a json representation of operation status" in new RouteMock {
+                    override def serviceId = "test-service"
+
+                    val lastOperation = testServiceModuleMock.lastOperation()._1
+                    lastOperation expects (None, None, "foo-instance", ServiceModule.OSB.Operation.CREATE, None, *, *) returning (Future
+                      .successful(ServiceModule.LastOperationStatus(
                         ServiceModule.OperationState.IN_PROGRESS,
                         Some("Are we there yet?"))))
 
-                  lastOperationRequest ~> route ~> check {
-                    response.status shouldEqual StatusCodes.OK
-                    responseAs[String] shouldEqual """{"state":"in progress","description":"Are we there yet?"}"""
+                    lastOperationRequest ~> route ~> check {
+                      response.status shouldEqual StatusCodes.OK
+                      responseAs[String] shouldEqual """{"state":"in progress","description":"Are we there yet?"}"""
+                    }
+
+                  }
+
+                }
+
+                "and a service module that delivers in a failure," - {
+
+                  "any Throwable" - {
+
+                    "it returns HTTP 500" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val lastOperation =
+                        testServiceModuleMock.lastOperation()._1
+                      lastOperation expects (None, None, "foo-instance", ServiceModule.OSB.Operation.CREATE, None, *, *) returning (Future
+                        .failed(new Throwable {}))
+
+                      lastOperationRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.ServiceUnavailable
+                      }
+
+                    }
+
+                  }
+
+                  "an InsufficientApplicationPermissions Throwable" - {
+
+                    "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val lastOperation =
+                        testServiceModuleMock.lastOperation()._1
+                      lastOperation expects (None, None, "foo-instance", ServiceModule.OSB.Operation.CREATE, None, *, *) returning (Future
+                        .failed(new InsufficientApplicationPermissions("foo")))
+
+                      lastOperationRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.Unauthorized
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
+                  }
+
+                  "a MalformedRequest Throwable" - {
+
+                    "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      val lastOperation =
+                        testServiceModuleMock.lastOperation()._1
+                      lastOperation expects (None, None, "foo-instance", ServiceModule.OSB.Operation.CREATE, None, *, *) returning (Future
+                        .failed(new MalformedRequest("foo")))
+
+                      lastOperationRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.BadRequest
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
                   }
 
                 }
@@ -315,24 +529,146 @@ class OpenServiceBrokerApiRouteTest
                         OpenServiceBrokerApi.APIModel.BindResource("app-id")))
                 ).withHeaders(credentials)
 
-                "it invokes the service module to return a json representation of it's BindResponse implementation" in new RouteMock {
-                  override def serviceId = "test-service"
+                "and a service module that delivers a BindResponse" - {
 
-                  import BasicServiceModule.OpenServiceBrokerModelSupport._
+                  "it returns a json representation of the ServiceModule's BindResponse implementation" in new RouteMock {
+                    override def serviceId = "test-service"
 
-                  val bindApplicationToServiceInstance =
-                    testServiceModuleMock.bindApplicationToServiceInstance()._1
+                    import BasicServiceModule.OpenServiceBrokerModelSupport._
 
-                  bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
-                    ServiceModule.OSB
-                      .BindResource("app-id")), "binding-id", "foo-instance", Some(CommonBindParameters(Some("foo"))), *, *) returning (Future
-                    .successful(CommonBindResponse(
-                      credentials = Some(Credentials("alice", "foo",
-                      nodes = List(Node("localhost", 80))))))) once ()
+                    val bindApplicationToServiceInstance =
+                      testServiceModuleMock
+                        .bindApplicationToServiceInstance()
+                        ._1
 
-                  bindApplicationToServiceInstanceRequest ~> route ~> check {
-                    response.status shouldEqual StatusCodes.OK
-                    responseAs[String] shouldEqual """{"credentials":{"username":"alice","password":"foo","nodes":[{"host":"localhost","port":80}]}}"""
+                    bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
+                      ServiceModule.OSB
+                        .BindResource("app-id")), "binding-id", "foo-instance", Some(
+                      CommonBindParameters(Some("foo"))), *, *) returning (Future
+                      .successful(
+                        CommonBindResponse(
+                          credentials = Some(Credentials(
+                            "alice",
+                            "foo",
+                            nodes = List(Node("localhost", 80))))))) once ()
+
+                    bindApplicationToServiceInstanceRequest ~> route ~> check {
+                      response.status shouldEqual StatusCodes.OK
+                      responseAs[String] shouldEqual """{"credentials":{"username":"alice","password":"foo","nodes":[{"host":"localhost","port":80}]}}"""
+                    }
+
+                  }
+
+                }
+
+                "and a service module that delivers in a failure," - {
+
+                  "any Throwable" - {
+
+                    "it returns HTTP 500" in new RouteMock {
+                      import BasicServiceModule.OpenServiceBrokerModelSupport._
+
+                      override def serviceId = "test-service"
+
+                      val bindApplicationToServiceInstance =
+                        testServiceModuleMock
+                          .bindApplicationToServiceInstance()
+                          ._1
+
+                      bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
+                        ServiceModule.OSB
+                          .BindResource("app-id")), "binding-id", "foo-instance", Some(
+                        CommonBindParameters(Some("foo"))), *, *) returning (Future
+                        .failed(new Throwable {})) once ()
+
+                      bindApplicationToServiceInstanceRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.ServiceUnavailable
+                      }
+
+                    }
+
+                  }
+
+                  "an InsufficientApplicationPermissions Throwable" - {
+
+                    "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+                      import BasicServiceModule.OpenServiceBrokerModelSupport._
+
+                      override def serviceId = "test-service"
+
+                      val bindApplicationToServiceInstance =
+                        testServiceModuleMock
+                          .bindApplicationToServiceInstance()
+                          ._1
+
+                      bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
+                        ServiceModule.OSB
+                          .BindResource("app-id")), "binding-id", "foo-instance", Some(
+                        CommonBindParameters(Some("foo"))), *, *) returning (Future
+                        .failed(new InsufficientApplicationPermissions("foo"))) once ()
+
+                      bindApplicationToServiceInstanceRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.Unauthorized
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
+                  }
+
+                  "a MalformedRequest Throwable" - {
+
+                    "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+                      import BasicServiceModule.OpenServiceBrokerModelSupport._
+
+                      override def serviceId = "test-service"
+
+                      val bindApplicationToServiceInstance =
+                        testServiceModuleMock
+                          .bindApplicationToServiceInstance()
+                          ._1
+
+                      bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
+                        ServiceModule.OSB
+                          .BindResource("app-id")), "binding-id", "foo-instance", Some(
+                        CommonBindParameters(Some("foo"))), *, *) returning (Future
+                        .failed(new MalformedRequest("foo"))) once ()
+
+                      bindApplicationToServiceInstanceRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.BadRequest
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
+                  }
+
+                  "a ServiceInstanceNotFound Throwable" - {
+
+                    "it returns HTTP 404 and the message from the Throwable" in new RouteMock {
+                      import BasicServiceModule.OpenServiceBrokerModelSupport._
+                      import ServiceModule.ServiceInstanceNotFound
+
+                      override def serviceId = "test-service"
+
+                      val bindApplicationToServiceInstance =
+                        testServiceModuleMock
+                          .bindApplicationToServiceInstance()
+                          ._1
+
+                      bindApplicationToServiceInstance expects ("service-guid", basicPlan, Some(
+                        ServiceModule.OSB
+                          .BindResource("app-id")), "binding-id", "foo-instance", Some(
+                        CommonBindParameters(Some("foo"))), *, *) returning (Future
+                        .failed(new ServiceInstanceNotFound("foo"))) once ()
+
+                      bindApplicationToServiceInstanceRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.NotFound
+                        responseAs[String] shouldEqual """{"description":"foo"}"""
+                      }
+
+                    }
+
                   }
 
                 }
@@ -349,23 +685,95 @@ class OpenServiceBrokerApiRouteTest
 
                 "for an existing binding" - {
 
-                  "it invokes the service module to carry out the unbinding of the application from the service instance, and return a json representation of the result" in new RouteMock {
-                    override def serviceId = "test-service"
+                  "and a service module that delivers an ApplicationUnboundFromServiceInstance response" - {
 
-                    val unbindApplicationFromServiceInstance =
-                      testServiceModuleMock
-                        .unbindApplicationFromServiceInstance()
-                        ._1
+                    "it returns a json representation confirming the application was unbound from the service instance" in new RouteMock {
+                      override def serviceId = "test-service"
 
-                    unbindApplicationFromServiceInstance expects ("service-guid", basicPlan, "binding-id", "foo-instance", *, *) returning (Future
-                      .successful(
-                        ServiceModule.ApplicationUnboundFromServiceInstance(
-                          "foo-instance",
-                          "binding-id"))) once ()
+                      val unbindApplicationFromServiceInstance =
+                        testServiceModuleMock
+                          .unbindApplicationFromServiceInstance()
+                          ._1
 
-                    unbindApplicationFromServiceInstanceRequest ~> route ~> check {
-                      response.status shouldEqual StatusCodes.OK
-                      responseAs[String] shouldEqual """{}"""
+                      unbindApplicationFromServiceInstance expects ("service-guid", basicPlan, "binding-id", "foo-instance", *, *) returning (Future
+                        .successful(
+                          ServiceModule.ApplicationUnboundFromServiceInstance(
+                            "foo-instance",
+                            "binding-id"))) once ()
+
+                      unbindApplicationFromServiceInstanceRequest ~> route ~> check {
+                        response.status shouldEqual StatusCodes.OK
+                        responseAs[String] shouldEqual """{}"""
+                      }
+
+                    }
+                  }
+
+                  "and a service module that delivers in a failure," - {
+
+                    "any Throwable" - {
+
+                      "it returns HTTP 500" in new RouteMock {
+                        override def serviceId = "test-service"
+
+                        val unbindApplicationFromServiceInstance =
+                          testServiceModuleMock
+                            .unbindApplicationFromServiceInstance()
+                            ._1
+
+                        unbindApplicationFromServiceInstance expects ("service-guid", basicPlan, "binding-id", "foo-instance", *, *) returning (Future
+                          .failed(new Throwable {})) once ()
+
+                        unbindApplicationFromServiceInstanceRequest ~> route ~> check {
+                          response.status shouldEqual StatusCodes.ServiceUnavailable
+                        }
+
+                      }
+
+                    }
+
+                    "an InsufficientApplicationPermissions Throwable" - {
+
+                      "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+                        override def serviceId = "test-service"
+
+                        val unbindApplicationFromServiceInstance =
+                          testServiceModuleMock
+                            .unbindApplicationFromServiceInstance()
+                            ._1
+
+                        unbindApplicationFromServiceInstance expects ("service-guid", basicPlan, "binding-id", "foo-instance", *, *) returning (Future
+                          .failed(new InsufficientApplicationPermissions("foo"))) once ()
+
+                        unbindApplicationFromServiceInstanceRequest ~> route ~> check {
+                          response.status shouldEqual StatusCodes.Unauthorized
+                          responseAs[String] shouldEqual """{"description":"foo"}"""
+                        }
+
+                      }
+
+                    }
+
+                    "a MalformedRequest Throwable" - {
+
+                      "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+                        override def serviceId = "test-service"
+
+                        val unbindApplicationFromServiceInstance =
+                          testServiceModuleMock
+                            .unbindApplicationFromServiceInstance()
+                            ._1
+
+                        unbindApplicationFromServiceInstance expects ("service-guid", basicPlan, "binding-id", "foo-instance", *, *) returning (Future
+                          .failed(new MalformedRequest("foo"))) once ()
+
+                        unbindApplicationFromServiceInstanceRequest ~> route ~> check {
+                          response.status shouldEqual StatusCodes.BadRequest
+                          responseAs[String] shouldEqual """{"description":"foo"}"""
+                        }
+
+                      }
+
                     }
 
                   }
@@ -396,22 +804,101 @@ class OpenServiceBrokerApiRouteTest
 
                     "and allows this particular plan update" - {
 
-                      "it invokes the service module to create the package parameters object for the update and returns HTTP Created with a json response indicating the correct pending operation" in new RouteMock {
-                        import BasicServiceModule.DCOSModelSupport._
-                        override def serviceId = "test-service"
+                      "and a service module that delivers a package options object in response to the UpdateServiceInstance request" - {
 
-                        val updateServiceInstance =
-                          testServiceModuleMock.updateServiceInstance()._1
+                        "it returns HTTP Created with a json response indicating the correct pending operation" in new RouteMock {
 
-                        updateServiceInstance expects ("service-guid", "foo-instance", Some(
-                          basicPlan), Some(ServiceModule.OSB.PreviousValues(
-                          "old-plan")), Some(CommonUpdateInstanceParameters(
-                          9)), *, *) returning (Future.successful(
-                          CommonPackageOptions(CommonService("foo"))))
+                          import BasicServiceModule.DCOSModelSupport._
+                          override def serviceId = "test-service"
 
-                        updateServiceInstanceRequest(serviceId) ~> route ~> check {
-                          response.status shouldEqual StatusCodes.Accepted
-                          responseAs[String] shouldEqual """{"operation":"update"}"""
+                          val updateServiceInstance =
+                            testServiceModuleMock.updateServiceInstance()._1
+
+                          updateServiceInstance expects ("service-guid", "foo-instance", Some(
+                            basicPlan), Some(ServiceModule.OSB.PreviousValues(
+                            "old-plan")), Some(CommonUpdateInstanceParameters(
+                            9)), *, *) returning (Future.successful(
+                            CommonPackageOptions(CommonService("foo"))))
+
+                          updateServiceInstanceRequest(serviceId) ~> route ~> check {
+                            response.status shouldEqual StatusCodes.Accepted
+                            responseAs[String] shouldEqual """{"operation":"update"}"""
+                          }
+
+                        }
+                      }
+
+                      "and a service module that delivers in a failure," - {
+
+                        "any Throwable" - {
+
+                          "it returns HTTP 500" in new RouteMock {
+
+                            import BasicServiceModule.DCOSModelSupport._
+                            override def serviceId = "test-service"
+
+                            val updateServiceInstance =
+                              testServiceModuleMock.updateServiceInstance()._1
+
+                            updateServiceInstance expects ("service-guid", "foo-instance", Some(
+                              basicPlan), Some(ServiceModule.OSB.PreviousValues(
+                              "old-plan")), Some(CommonUpdateInstanceParameters(
+                              9)), *, *) returning (Future.failed(new Throwable {}))
+
+                            updateServiceInstanceRequest(serviceId) ~> route ~> check {
+                              response.status shouldEqual StatusCodes.ServiceUnavailable
+                            }
+
+                          }
+
+                        }
+
+                        "an InsufficientApplicationPermissions Throwable" - {
+
+                          "it returns HTTP 401 and the message from the Throwable" in new RouteMock {
+
+                            import BasicServiceModule.DCOSModelSupport._
+                            override def serviceId = "test-service"
+
+                            val updateServiceInstance =
+                              testServiceModuleMock.updateServiceInstance()._1
+
+                            updateServiceInstance expects ("service-guid", "foo-instance", Some(
+                              basicPlan), Some(ServiceModule.OSB.PreviousValues(
+                              "old-plan")), Some(CommonUpdateInstanceParameters(
+                              9)), *, *) returning (Future.failed(new InsufficientApplicationPermissions("foo")))
+
+                            updateServiceInstanceRequest(serviceId) ~> route ~> check {
+                              response.status shouldEqual StatusCodes.Unauthorized
+                              responseAs[String] shouldEqual """{"description":"foo"}"""
+                            }
+
+                          }
+
+                        }
+
+                        "a MalformedRequest Throwable" - {
+
+                          "it returns HTTP 400 and the message from the Throwable" in new RouteMock {
+
+                            import BasicServiceModule.DCOSModelSupport._
+                            override def serviceId = "test-service"
+
+                            val updateServiceInstance =
+                              testServiceModuleMock.updateServiceInstance()._1
+
+                            updateServiceInstance expects ("service-guid", "foo-instance", Some(
+                              basicPlan), Some(ServiceModule.OSB.PreviousValues(
+                              "old-plan")), Some(CommonUpdateInstanceParameters(
+                              9)), *, *) returning (Future.failed(new MalformedRequest("foo")))
+
+                            updateServiceInstanceRequest(serviceId) ~> route ~> check {
+                              response.status shouldEqual StatusCodes.BadRequest
+                              responseAs[String] shouldEqual """{"description":"foo"}"""
+                            }
+
+                          }
+
                         }
 
                       }
@@ -448,25 +935,29 @@ class OpenServiceBrokerApiRouteTest
 
               "given an invalid update service instance request" - {
 
-                "in that it does not specify a new plan nor a parameters object" - new APIModel.JsonSupport {
+                "in that" - {
 
-                  def updateServiceInstanceRequest(serviceId: String) =
-                    Patch(
-                      s"/dcosb/$serviceId/broker/v2/service_instances/foo-instance/?accepts_incomplete=true",
-                      OpenServiceBrokerApi.APIModel.UpdateInstance(
-                        "service-guid",
-                        None,
-                        None,
-                        Some(OpenServiceBrokerApi.APIModel.PreviousValues(
-                          "old-plan")))
-                    ).withHeaders(credentials)
+                  "it does not specify a new plan nor a parameters object" - new APIModel.JsonSupport {
 
-                  "it returns HTTP Bad Request explaining the error" in new RouteMock {
-                    override def serviceId = "test-service"
+                    def updateServiceInstanceRequest(serviceId: String) =
+                      Patch(
+                        s"/dcosb/$serviceId/broker/v2/service_instances/foo-instance/?accepts_incomplete=true",
+                        OpenServiceBrokerApi.APIModel.UpdateInstance(
+                          "service-guid",
+                          None,
+                          None,
+                          Some(OpenServiceBrokerApi.APIModel.PreviousValues(
+                            "old-plan")))
+                      ).withHeaders(credentials)
 
-                    updateServiceInstanceRequest(serviceId) ~> route ~> check {
-                      response.status shouldEqual StatusCodes.BadRequest
-                      responseAs[String] shouldEqual """{"description":"No updated plan or parameters were provided - not sure what you need changed"}"""
+                    "it returns HTTP Bad Request explaining the error" in new RouteMock {
+                      override def serviceId = "test-service"
+
+                      updateServiceInstanceRequest(serviceId) ~> route ~> check {
+                        response.status shouldEqual StatusCodes.BadRequest
+                        responseAs[String] shouldEqual """{"description":"No updated plan or parameters were provided - not sure what you need changed"}"""
+                      }
+
                     }
 
                   }
